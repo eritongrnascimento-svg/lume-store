@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Lume Store
+Comment=Pesquisar e instalar pacotes APT e Flatpak
+Exec=lume-store
+Icon=io.github.eritongrnascimento_svg.LumeStore
+Terminal=false
+Categories=System;PackageManager;

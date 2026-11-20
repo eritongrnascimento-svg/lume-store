@@ -1,0 +1,232 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-3.0-only
+import os
+import queue
+import re
+import subprocess
+import threading
+import tkinter as tk
+from dataclasses import dataclass
+from tkinter import messagebox, ttk
+
+APT = "APT"
+FLATPAK = "Flatpak"
+ICON = "/usr/share/icons/hicolor/256x256/apps/io.github.eritongrnascimento_svg.LumeStore.png"
+
+
+@dataclass(frozen=True)
+class Package:
+    name: str
+    identifier: str
+    summary: str
+    remote: str = ""
+    scope: str = ""
+
+
+def run(*args, timeout=45):
+    env = {**os.environ, "NO_COLOR": "1", "TERM": "dumb"}
+    result = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True,
+                            text=True, encoding="utf-8", errors="replace", env=env, timeout=timeout)
+    if result.returncode:
+        raise RuntimeError((result.stderr or result.stdout).strip() or f"Falha em {args[0]}")
+    return result.stdout
+
+
+def apt_results(query):
+    pattern = re.escape(query)
+    result = []
+    for line in run("apt-cache", "search", "--", pattern).splitlines():
+        identifier, sep, summary = line.partition(" - ")
+        if sep and re.fullmatch(r"[a-z0-9][a-z0-9+.-]*", identifier):
+            result.append(Package(identifier, identifier, summary))
+    return result
+
+
+def flatpak_results(query):
+    results, errors = [], []
+    configured = False
+    for scope in ("--user", "--system"):
+        remotes = run("flatpak", "remotes", scope, "--columns=name").splitlines()
+        for remote in remotes:
+            remote = remote.strip()
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", remote):
+                continue
+            configured = True
+            try:
+                listing = run("flatpak", "remote-ls", scope, "--app",
+                              "--columns=ref,name,description", "--", remote)
+            except (RuntimeError, subprocess.TimeoutExpired) as error:
+                errors.append(f"{remote}: {error}")
+                continue
+            for line in listing.splitlines():
+                columns = line.split("\t", 2)
+                if len(columns) < 2:
+                    continue
+                ref, name, *description = [value.strip() for value in columns]
+                if not re.fullmatch(r"(?:app/)?[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+/[A-Za-z0-9_]+/[A-Za-z0-9_.-]+", ref):
+                    continue
+                summary = description[0] if description else ""
+                if query.casefold() in " ".join((ref, name, summary)).casefold():
+                    results.append(Package(name or ref, ref, summary, remote, scope))
+    if not configured:
+        raise RuntimeError("Nenhum remoto Flatpak está configurado neste computador.")
+    if errors and not results:
+        raise RuntimeError("\n".join(errors))
+    return list(dict.fromkeys(results)), errors
+
+
+def install_command(package):
+    if package.remote:
+        return ("flatpak", "install", package.scope, "--noninteractive", "--assumeyes",
+                "--", package.remote, package.identifier)
+    return ("pkcon", "--noninteractive", "install", package.identifier)
+
+
+class Store(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Lume Store")
+        self.geometry("880x620")
+        self.minsize(640, 430)
+        self.configure(bg="#14142c")
+        if os.path.isfile(ICON):
+            self.logo = tk.PhotoImage(file=ICON).subsample(5)
+            self.iconphoto(True, self.logo)
+        self.tasks = queue.Queue()
+        self.packages = []
+        self.source = tk.StringVar(value=APT)
+        self.query = tk.StringVar()
+        self.status = tk.StringVar(value="Digite um nome para pesquisar.")
+        self.detail = tk.StringVar()
+        style = ttk.Style(self)
+        style.theme_use("clam")
+        style.configure("TFrame", background="#14142c")
+        style.configure("TLabel", background="#14142c", foreground="#eeedff")
+        style.configure("TButton", padding=8)
+        style.configure("Treeview", rowheight=33, background="#282751", foreground="white", fieldbackground="#282751")
+        style.map("Treeview", background=[("selected", "#6549b9")])
+        frame = ttk.Frame(self, padding=24)
+        frame.pack(fill="both", expand=True)
+        header = ttk.Frame(frame)
+        header.pack(fill="x", pady=(0, 15))
+        if hasattr(self, "logo"):
+            ttk.Label(header, image=self.logo).pack(side="left", padx=(0, 10))
+        ttk.Label(header, text="Lume Store", font=("Sans", 24, "bold")).pack(side="left")
+        controls = ttk.Frame(frame)
+        controls.pack(fill="x", pady=(0, 12))
+        self.sources = ttk.Combobox(controls, textvariable=self.source, values=(APT, FLATPAK), state="readonly", width=12)
+        self.sources.pack(side="left")
+        self.sources.bind("<<ComboboxSelected>>", lambda _: self.clear())
+        entry = ttk.Entry(controls, textvariable=self.query)
+        entry.pack(side="left", fill="x", expand=True, padx=8)
+        entry.bind("<Return>", lambda _: self.search())
+        self.search_button = ttk.Button(controls, text="Pesquisar", command=self.search)
+        self.search_button.pack(side="right")
+        grid = ttk.Frame(frame)
+        grid.pack(fill="both", expand=True)
+        self.table = ttk.Treeview(grid, columns=("name", "origin"), show="headings", selectmode="browse")
+        self.table.heading("name", text="Aplicativo")
+        self.table.heading("origin", text="Origem")
+        self.table.column("origin", width=210, stretch=False)
+        self.table.pack(side="left", fill="both", expand=True)
+        scrollbar = ttk.Scrollbar(grid, orient="vertical", command=self.table.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.table.configure(yscrollcommand=scrollbar.set)
+        self.table.bind("<<TreeviewSelect>>", lambda _: self.selection())
+        ttk.Label(frame, textvariable=self.detail, wraplength=590, justify="left").pack(fill="x", pady=10)
+        self.install_button = ttk.Button(frame, text="Instalar", command=self.install, state="disabled")
+        self.install_button.pack(anchor="e")
+        ttk.Label(frame, textvariable=self.status, wraplength=590).pack(fill="x", pady=(8, 0))
+        entry.focus_set()
+        self.busy = False
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.after(100, self.poll)
+
+    def close(self):
+        if self.busy and self.operation == "Instalando…":
+            messagebox.showinfo("Lume Store", "Aguarde a conclusão da instalação.")
+        else:
+            self.destroy()
+
+    def clear(self):
+        self.table.delete(*self.table.get_children())
+        self.packages = []
+        self.detail.set("")
+        self.status.set("Digite um nome para pesquisar.")
+        self.selection()
+
+    def selection(self):
+        rows = self.table.selection()
+        self.install_button.configure(state="normal" if rows and not self.busy else "disabled")
+        if rows:
+            package = self.packages[int(rows[0])]
+            self.detail.set(f"{package.identifier}\n{package.summary}")
+
+    def start(self, message, work, done):
+        self.busy = True
+        self.operation = message
+        self.status.set(message)
+        self.search_button.configure(state="disabled")
+        self.sources.configure(state="disabled")
+        self.install_button.configure(state="disabled")
+
+        def background():
+            try:
+                self.tasks.put((done, work(), None))
+            except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+                self.tasks.put((done, None, str(error)))
+
+        threading.Thread(target=background, daemon=True).start()
+
+    def poll(self):
+        try:
+            done, result, error = self.tasks.get_nowait()
+        except queue.Empty:
+            pass
+        else:
+            self.busy = False
+            self.search_button.configure(state="normal")
+            self.sources.configure(state="readonly")
+            self.selection()
+            if error:
+                self.status.set("A operação falhou.")
+                messagebox.showerror("Lume Store", error[:2500])
+            else:
+                done(result)
+        self.after(100, self.poll)
+
+    def search(self):
+        query = self.query.get().strip()
+        if self.busy or not query:
+            return
+        source = self.source.get()
+        self.clear()
+        self.start("Pesquisando…",
+                   lambda: (apt_results(query), []) if source == APT else flatpak_results(query),
+                   self.show_results)
+
+    def show_results(self, result):
+        packages, errors = result
+        self.packages = sorted(packages, key=lambda package: package.name.casefold())[:250]
+        for index, package in enumerate(self.packages):
+            scope = "usuário" if package.scope == "--user" else "sistema"
+            origin = f"{package.remote} · {scope}" if package.remote else APT
+            self.table.insert("", "end", iid=str(index), values=(package.name, origin))
+        status = f"{len(self.packages)} de {len(packages)} resultados."
+        if errors:
+            status += " Alguns remotos Flatpak ficaram indisponíveis."
+        self.status.set(status)
+
+    def install(self):
+        rows = self.table.selection()
+        if self.busy or not rows:
+            return
+        package = self.packages[int(rows[0])]
+        source = package.remote or APT
+        if messagebox.askyesno("Confirmar instalação", f"Instalar {package.name} de {source}?"):
+            self.start("Instalando…", lambda: run(*install_command(package), timeout=None),
+                       lambda _: self.status.set(f"{package.name}: instalação concluída."))
+
+
+if __name__ == "__main__":
+    Store().mainloop()
